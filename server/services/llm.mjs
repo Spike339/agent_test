@@ -1,179 +1,471 @@
 import { config } from '../config.mjs'
+import { saveToolCallLog } from './log.mjs'
+import {
+  getChatCompletionToolDefinitions,
+  getResponseToolDefinitions,
+  runToolCall,
+} from './tools.mjs'
 
-const wireApiHandlers = {
-  responses: {
-    request: requestResponse,
-    normalize: normalizeResponsesApiResult,
-  },
-  chat_completions: {
-    request: requestChatCompletion,
-    normalize: normalizeChatCompletionsResult,
-  },
-}
+const maxToolIterations = 6
 
 export async function createChatCompletion({ messages, model }) {
   if (!config.openaiApiKey) {
-    throw new Error('Missing OPENAI_API_KEY in .env')
+    throw new Error('OPENAI_API_KEY is not configured')
   }
 
-  const handler = wireApiHandlers[config.openaiWireApi]
+  const selectedModel = model ?? config.openaiModel
+  const startedAt = Date.now()
+  const requestId = crypto.randomUUID()
 
-  if (!handler) {
-    throw new Error(
-      `Unsupported OPENAI_WIRE_API "${config.openaiWireApi}". Use "responses" or "chat_completions".`,
+  if (config.openaiWireApi === 'chat_completions') {
+    const result = await createChatCompletionsResponse({
+      messages,
+      model: selectedModel,
+      requestId,
+    })
+
+    return {
+      ...result,
+      latency_ms: Date.now() - startedAt,
+      request_id: requestId,
+    }
+  }
+
+  const result = await createResponsesApiResponse({
+    messages,
+    model: selectedModel,
+    requestId,
+  })
+
+  return {
+    ...result,
+    latency_ms: Date.now() - startedAt,
+    request_id: requestId,
+  }
+}
+
+async function createChatCompletionsResponse({ messages, model, requestId }) {
+  const conversation = [...messages]
+  let totalUsage = {
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    total_tokens: 0,
+  }
+
+  for (let iteration = 0; iteration < maxToolIterations; iteration += 1) {
+    const data = await postOpenAiJson('chat/completions', {
+      model,
+      messages: conversation,
+      ...getChatCompletionToolOptions(),
+    })
+    const choice = data.choices?.[0]
+    const message = choice?.message
+
+    totalUsage = mergeUsage(totalUsage, normalizeUsage(data.usage))
+
+    if (!message) {
+      throw new Error('Chat Completions API returned no message')
+    }
+
+    conversation.push(normalizeAssistantMessage(message))
+
+    if (!Array.isArray(message.tool_calls) || message.tool_calls.length === 0) {
+      const assistantContent = normalizeTextContent(message.content)
+
+      if (!assistantContent.trim()) {
+        throw new Error('Chat Completions API did not include assistant content')
+      }
+
+      return {
+        message: {
+          role: 'assistant',
+          content: assistantContent,
+        },
+        usage: totalUsage,
+        model: data.model ?? model,
+      }
+    }
+
+    const toolMessages = await Promise.all(
+      message.tool_calls.map(async (toolCall) => {
+        const toolName = toolCall.function?.name
+        const toolResult = await runToolCallWithLog({
+          requestId,
+          provider: 'chat_completions',
+          iteration,
+          toolCallId: toolCall.id,
+          toolName,
+          rawArguments: toolCall.function?.arguments,
+        })
+
+        return {
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: JSON.stringify(toolResult),
+        }
+      }),
     )
+
+    conversation.push(...toolMessages)
   }
 
-  const selectedModel = model || config.openaiModel
-  const startedAt = performance.now()
-  const response = await handler.request(selectedModel, messages)
-  const latencyMs = Math.round(performance.now() - startedAt)
-  const data = await response.json().catch(() => null)
+  throw new Error('Tool calling exceeded the maximum number of iterations')
+}
 
-  if (!response.ok) {
-    const message =
-      data?.error?.message ?? `LLM request failed with status ${response.status}`
+async function createResponsesApiResponse({ messages, model, requestId }) {
+  let input = toResponsesInput(messages)
+  let response = await postOpenAiJson('responses', {
+    model,
+    input,
+    ...getResponseToolOptions(),
+    ...getReasoningOptions(),
+  })
+  let totalUsage = normalizeUsage(response.usage)
 
-    throw new Error(message)
+  for (let iteration = 0; iteration < maxToolIterations; iteration += 1) {
+    const functionCalls = extractResponseFunctionCalls(response)
+
+    if (functionCalls.length === 0) {
+      const assistantContent = extractResponseOutputText(response)
+
+      if (!assistantContent.trim()) {
+        throw new Error('Responses API did not include assistant content')
+      }
+
+      return {
+        message: {
+          role: 'assistant',
+          content: assistantContent,
+        },
+        usage: totalUsage,
+        model: response.model ?? model,
+      }
+    }
+
+    const functionOutputs = await Promise.all(
+      functionCalls.map(async (call) => {
+        const toolResult = await runToolCallWithLog({
+          requestId,
+          provider: 'responses',
+          iteration,
+          toolCallId: call.call_id,
+          toolName: call.name,
+          rawArguments: call.arguments,
+        })
+
+        return {
+          type: 'function_call_output',
+          call_id: call.call_id,
+          output: JSON.stringify(toolResult),
+        }
+      }),
+    )
+
+    input = [
+      ...input,
+      ...normalizeResponseOutputForNextInput(response.output),
+      ...functionOutputs,
+    ]
+    response = await postOpenAiJson('responses', {
+      model,
+      input,
+      ...getResponseToolOptions(),
+      ...getReasoningOptions(),
+    })
+    totalUsage = mergeUsage(totalUsage, normalizeUsage(response.usage))
+  }
+
+  throw new Error('Tool calling exceeded the maximum number of iterations')
+}
+
+async function runToolCallWithLog({
+  requestId,
+  provider,
+  iteration,
+  toolCallId,
+  toolName,
+  rawArguments,
+}) {
+  const startedAt = Date.now()
+
+  try {
+    const result = await runToolCall(toolName, rawArguments)
+    const latencyMs = Date.now() - startedAt
+
+    await saveToolCallLog({
+      requestId,
+      provider,
+      iteration,
+      toolCallId,
+      toolName,
+      arguments: normalizeToolArgumentsForLog(rawArguments),
+      result,
+      status: 'success',
+      latencyMs,
+    })
+
+    return result
+  } catch (error) {
+    const latencyMs = Date.now() - startedAt
+    const message = error instanceof Error ? error.message : 'Unknown tool error'
+    const errorResult = {
+      ok: false,
+      tool_name: toolName,
+      error: {
+        message,
+      },
+      note: 'The tool call failed. Explain the failure to the user and suggest trying again later or using another source if needed.',
+    }
+
+    await saveToolCallLog({
+      requestId,
+      provider,
+      iteration,
+      toolCallId,
+      toolName,
+      arguments: normalizeToolArgumentsForLog(rawArguments),
+      error: {
+        message,
+      },
+      result: errorResult,
+      status: 'error',
+      latencyMs,
+    })
+
+    return errorResult
+  }
+}
+
+function normalizeToolArgumentsForLog(rawArguments) {
+  if (typeof rawArguments !== 'string') {
+    return rawArguments ?? {}
+  }
+
+  try {
+    return JSON.parse(rawArguments)
+  } catch {
+    return rawArguments
+  }
+}
+
+function toResponsesInput(messages) {
+  return messages.map((message) => ({
+    role: message.role,
+    content: message.content,
+  }))
+}
+
+function normalizeResponseOutputForNextInput(output) {
+  if (!Array.isArray(output)) {
+    return []
+  }
+
+  return output
+    .map((item) => {
+      if (item?.type === 'function_call') {
+        return {
+          type: 'function_call',
+          call_id: item.call_id,
+          name: item.name,
+          arguments: item.arguments,
+        }
+      }
+
+      if (item?.type === 'message' && item.role) {
+        return item
+      }
+
+      return null
+    })
+    .filter(Boolean)
+}
+
+function getReasoningOptions() {
+  if (!config.openaiReasoningEffort) {
+    return {}
   }
 
   return {
-    ...handler.normalize(data, selectedModel),
-    latency_ms: latencyMs,
+    reasoning: {
+      effort: config.openaiReasoningEffort,
+    },
   }
 }
 
-function trimTrailingSlash(value) {
-  return value.replace(/\/+$/, '')
+function getChatCompletionToolOptions() {
+  if (!config.toolsEnabled) {
+    return {}
+  }
+
+  return {
+    tools: getChatCompletionToolDefinitions(),
+    tool_choice: 'auto',
+  }
 }
 
-async function requestResponse(model, messages) {
-  return requestLlm('/responses', {
-    model,
-    input: messages.map((message) => ({
-      role: message.role,
-      content: message.content,
-    })),
-    ...buildResponsesOptions(),
-  })
+function getResponseToolOptions() {
+  if (!config.toolsEnabled) {
+    return {}
+  }
+
+  return {
+    tools: getResponseToolDefinitions(),
+  }
 }
 
-async function requestChatCompletion(model, messages) {
-  return requestLlm('/chat/completions', {
-    model,
-    messages,
-  })
-}
+async function postOpenAiJson(path, payload) {
+  const url = new URL(path.replace(/^\/+/, ''), normalizeBaseUrl(config.openaiBaseUrl))
 
-async function requestLlm(path, body) {
+  let response
+
   try {
-    return await fetch(`${trimTrailingSlash(config.openaiBaseUrl)}${path}`, {
+    response = await fetch(url, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${config.openaiApiKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(payload),
     })
   } catch (error) {
-    const reason = getFetchFailureReason(error)
+    const message = error instanceof Error ? error.message : 'fetch failed'
 
-    throw new Error(
-      `Cannot reach OPENAI_BASE_URL (${config.openaiBaseUrl}): ${reason}`,
-    )
+    throw new Error(`Cannot reach OPENAI_BASE_URL (${config.openaiBaseUrl}): ${message}`)
   }
+
+  const data = await response.json().catch(() => null)
+
+  if (!response.ok) {
+    const detail =
+      typeof data?.error?.message === 'string'
+        ? data.error.message
+        : typeof data?.error === 'string'
+          ? data.error
+          : response.statusText
+
+    throw new Error(`OpenAI API error ${response.status}: ${detail}`)
+  }
+
+  return data
 }
 
-function buildResponsesOptions() {
-  return {
-    ...(config.openaiReasoningEffort
-      ? {
-          reasoning: {
-            effort: config.openaiReasoningEffort,
-          },
+function normalizeBaseUrl(baseUrl) {
+  return baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`
+}
+
+function normalizeAssistantMessage(message) {
+  const assistantMessage = {
+    role: 'assistant',
+    content: normalizeAssistantContent(message.content),
+  }
+
+  if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+    assistantMessage.tool_calls = message.tool_calls
+  }
+
+  return assistantMessage
+}
+
+function normalizeAssistantContent(content) {
+  if (typeof content === 'string') {
+    return content
+  }
+
+  if (Array.isArray(content)) {
+    return normalizeTextContent(content)
+  }
+
+  return null
+}
+
+function normalizeTextContent(content) {
+  if (typeof content === 'string') {
+    return content
+  }
+
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        if (typeof item === 'string') {
+          return item
         }
-      : {}),
-    store: false,
+
+        if (typeof item?.text === 'string') {
+          return item.text
+        }
+
+        return ''
+      })
+      .filter(Boolean)
+      .join('\n')
   }
+
+  return ''
 }
 
-function normalizeResponsesApiResult(data, fallbackModel) {
-  const assistantContent = extractResponsesOutputText(data)
-
-  if (assistantContent.length === 0) {
-    throw new Error('Responses API did not include assistant content')
+function extractResponseFunctionCalls(response) {
+  if (!Array.isArray(response.output)) {
+    return []
   }
 
-  return {
-    message: {
-      role: 'assistant',
-      content: assistantContent,
-    },
-    usage: {
-      prompt_tokens: Number(data?.usage?.input_tokens ?? 0),
-      completion_tokens: Number(data?.usage?.output_tokens ?? 0),
-      total_tokens: Number(data?.usage?.total_tokens ?? 0),
-    },
-    model: data?.model ?? fallbackModel,
-  }
+  return response.output
+    .filter((item) => item?.type === 'function_call')
+    .map((item) => ({
+      call_id: item.call_id,
+      name: item.name,
+      arguments: item.arguments,
+    }))
+    .filter((call) => call.call_id && call.name)
 }
 
-function normalizeChatCompletionsResult(data, fallbackModel) {
-  const assistantContent = data?.choices?.[0]?.message?.content
-
-  if (typeof assistantContent !== 'string' || assistantContent.length === 0) {
-    throw new Error('Chat Completions API did not include assistant content')
+function extractResponseOutputText(response) {
+  if (typeof response.output_text === 'string' && response.output_text.trim()) {
+    return response.output_text
   }
 
-  return {
-    message: {
-      role: 'assistant',
-      content: assistantContent,
-    },
-    usage: {
-      prompt_tokens: Number(data?.usage?.prompt_tokens ?? 0),
-      completion_tokens: Number(data?.usage?.completion_tokens ?? 0),
-      total_tokens: Number(data?.usage?.total_tokens ?? 0),
-    },
-    model: data?.model ?? fallbackModel,
-  }
-}
-
-function extractResponsesOutputText(responseBody) {
-  if (typeof responseBody?.output_text === 'string') {
-    return responseBody.output_text
-  }
-
-  const output = responseBody?.output
-
-  if (!Array.isArray(output)) {
+  if (!Array.isArray(response.output)) {
     return ''
   }
 
-  return output
-    .flatMap((item) => {
-      if (!item || item.type !== 'message' || !Array.isArray(item.content)) {
-        return []
+  return response.output
+    .flatMap((item) => (Array.isArray(item?.content) ? item.content : []))
+    .map((contentItem) => {
+      if (typeof contentItem?.text === 'string') {
+        return contentItem.text
       }
 
-      return item.content
-        .filter((contentItem) => contentItem && contentItem.type === 'output_text')
-        .map((contentItem) => contentItem.text)
+      if (typeof contentItem?.content === 'string') {
+        return contentItem.content
+      }
+
+      return ''
     })
-    .filter((text) => typeof text === 'string')
-    .join('')
+    .filter(Boolean)
+    .join('\n')
 }
 
-function getFetchFailureReason(error) {
-  if (!(error instanceof Error)) {
-    return 'unknown network error'
+function normalizeUsage(usage) {
+  const promptTokens =
+    usage?.prompt_tokens ?? usage?.input_tokens ?? usage?.input_token_count ?? 0
+  const completionTokens =
+    usage?.completion_tokens ??
+    usage?.output_tokens ??
+    usage?.output_token_count ??
+    0
+  const totalTokens = usage?.total_tokens ?? promptTokens + completionTokens
+
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: totalTokens,
   }
+}
 
-  const cause = error.cause
-
-  if (cause && typeof cause === 'object' && 'code' in cause) {
-    return `${error.message} (${cause.code})`
+function mergeUsage(currentUsage, nextUsage) {
+  return {
+    prompt_tokens: currentUsage.prompt_tokens + nextUsage.prompt_tokens,
+    completion_tokens:
+      currentUsage.completion_tokens + nextUsage.completion_tokens,
+    total_tokens: currentUsage.total_tokens + nextUsage.total_tokens,
   }
-
-  return error.message
 }

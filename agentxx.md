@@ -113,9 +113,9 @@ Agent Loop
 
 学习：
 
-- Tool Calling
-- JSON Schema
-- ReAct 思想
+- Tool Calling ：Tool Calling 是让 LLM 通过结构化方式调用外部能力，从“只会回答”升级到“能查数据、能操作系统、能完成任务”。
+- JSON Schema：用一份结构化规则，约束和校验另一份 JSON 数据，让程序知道输入是否可靠。
+- ReAct 思想 先想下一步，再调用工具，观察结果，再继续想，直到完成任务。
 - 为什么 Tool 是 Agent 的核心
 
 任务：
