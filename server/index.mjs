@@ -1,5 +1,5 @@
 import { createServer } from 'node:http'
-import { config } from './config.mjs'
+import { runtimeConfig } from './config.mjs'
 import { handleChatRoute } from './routes/chat.mjs'
 import { handleLogsRoute } from './routes/logs.mjs'
 
@@ -22,6 +22,6 @@ const server = createServer(async (request, response) => {
   response.end(JSON.stringify({ error: 'Not found' }))
 })
 
-server.listen(config.port, () => {
-  console.log(`API server listening on http://localhost:${config.port}`)
+server.listen(runtimeConfig.port, () => {
+  console.log(`API server listening on http://localhost:${runtimeConfig.port}`)
 })

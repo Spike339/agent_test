@@ -1,4 +1,4 @@
-import { createChatCompletion } from '../services/llm.mjs'
+import { createAgentChatCompletion } from '../services/agent-chat.mjs'
 import { saveChatLog } from '../services/log.mjs'
 
 export async function handleChatRoute(request, response) {
@@ -11,7 +11,7 @@ export async function handleChatRoute(request, response) {
     const body = await readJsonBody(request)
     const messages = normalizeMessages(body?.messages)
     const model = typeof body?.model === 'string' ? body.model : undefined
-    const result = await createChatCompletion({ messages, model })
+    const result = await createAgentChatCompletion({ messages, model })
     const latestUserMessage = [...messages]
       .reverse()
       .find((message) => message.role === 'user')
