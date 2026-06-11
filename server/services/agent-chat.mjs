@@ -6,9 +6,12 @@ const config = serverConfig.config ?? serverConfig.runtimeConfig;
 // agent-chat 是业务适配层
 export async function createAgentChatCompletion({ messages, model }) {
   const trace = [];
+  const startedAt = Date.now();
+  const requestId = crypto.randomUUID();
+  const selectedModel = model ?? config.openaiModel;
   // 真实的调用 runAgnet，
   const agentResult = await runAgent({
-    llm: createRealLLM({ model }), 
+    llm: createRealLLM({ model: selectedModel }), 
     tools: createRuntimeTools(),
     messages: [...messages],
     options: {
@@ -35,7 +38,9 @@ export async function createAgentChatCompletion({ messages, model }) {
       completion_tokens: 0,
       total_tokens: 0,
     },
-    model: model ?? "agent-runtime-demo",
+    model: selectedModel,
+    latency_ms: Date.now() - startedAt,
+    request_id: requestId,
   };
 }
 
