@@ -33,7 +33,7 @@ export async function createAgentChatCompletion({ messages, model }) {
       role: "assistant",
       content: getAgentContent(agentResult),
     },
-    usage: {
+    usage: agentResult.usage ?? {
       prompt_tokens: 0,
       completion_tokens: 0,
       total_tokens: 0,
@@ -90,6 +90,7 @@ function createRealLLM({ model }) {
           name: toolCall.function?.name,
           args: parseToolArguments(toolCall.function?.arguments),
         },
+        usage: normalizeUsage(data.usage),
       }
     }
 
@@ -102,6 +103,7 @@ function createRealLLM({ model }) {
     return {
       type: 'final',
       content,
+      usage: normalizeUsage(data.usage),
     }
   }
 }
@@ -257,4 +259,17 @@ async function postOpenAiJson(path, payload) {
   }
 
   return data
+}
+
+
+function normalizeUsage(usage) {
+  const promptTokens = usage?.prompt_tokens ?? 0
+  const completionTokens = usage?.completion_tokens ?? 0
+  const totalTokens = usage?.total_tokens ?? promptTokens + completionTokens
+
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: totalTokens,
+  }
 }

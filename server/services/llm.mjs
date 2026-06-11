@@ -1,4 +1,4 @@
-import { config } from '../config.mjs'
+import { runtimeConfig } from '../config.mjs'
 import { saveToolCallLog } from './log.mjs'
 import {
   getChatCompletionToolDefinitions,
@@ -9,15 +9,15 @@ import {
 const maxToolIterations = 6
 
 export async function createChatCompletion({ messages, model }) {
-  if (!config.openaiApiKey) {
+  if (!runtimeConfig.openaiApiKey) {
     throw new Error('OPENAI_API_KEY is not configured')
   }
 
-  const selectedModel = model ?? config.openaiModel
+  const selectedModel = model ?? runtimeConfig.openaiModel
   const startedAt = Date.now()
   const requestId = crypto.randomUUID()
 
-  if (config.openaiWireApi === 'chat_completions') {
+  if (runtimeConfig.openaiWireApi === 'chat_completions') {
     const result = await createChatCompletionsResponse({
       messages,
       model: selectedModel,
@@ -281,19 +281,19 @@ function normalizeResponseOutputForNextInput(output) {
 }
 
 function getReasoningOptions() {
-  if (!config.openaiReasoningEffort) {
+  if (!runtimeConfig.openaiReasoningEffort) {
     return {}
   }
 
   return {
     reasoning: {
-      effort: config.openaiReasoningEffort,
+      effort: runtimeConfig.openaiReasoningEffort,
     },
   }
 }
 
 function getChatCompletionToolOptions() {
-  if (!config.toolsEnabled) {
+  if (!runtimeConfig.toolsEnabled) {
     return {}
   }
 
@@ -304,7 +304,7 @@ function getChatCompletionToolOptions() {
 }
 
 function getResponseToolOptions() {
-  if (!config.toolsEnabled) {
+  if (!runtimeConfig.toolsEnabled) {
     return {}
   }
 
@@ -314,7 +314,7 @@ function getResponseToolOptions() {
 }
 
 async function postOpenAiJson(path, payload) {
-  const url = new URL(path.replace(/^\/+/, ''), normalizeBaseUrl(config.openaiBaseUrl))
+  const url = new URL(path.replace(/^\/+/, ''), normalizeBaseUrl(runtimeConfig.openaiBaseUrl))
 
   let response
 
@@ -322,7 +322,7 @@ async function postOpenAiJson(path, payload) {
     response = await fetch(url, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${config.openaiApiKey}`,
+        Authorization: `Bearer ${runtimeConfig.openaiApiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(payload),
@@ -330,7 +330,7 @@ async function postOpenAiJson(path, payload) {
   } catch (error) {
     const message = error instanceof Error ? error.message : 'fetch failed'
 
-    throw new Error(`Cannot reach OPENAI_BASE_URL (${config.openaiBaseUrl}): ${message}`)
+    throw new Error(`Cannot reach OPENAI_BASE_URL (${runtimeConfig.openaiBaseUrl}): ${message}`)
   }
 
   const data = await response.json().catch(() => null)

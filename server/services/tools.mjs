@@ -352,13 +352,13 @@ async function getWeather(args) {
     throw new Error('get_weather location is too long')
   }
 
-  if (config.weatherProvider === 'qweather') {
+  if (runtimeConfig.weatherProvider === 'qweather') {
     return getQWeather(location)
   }
 
-  if (config.weatherProvider !== 'open_meteo') {
+  if (runtimeConfig.weatherProvider !== 'open_meteo') {
     throw new Error(
-      `Unsupported WEATHER_PROVIDER "${config.weatherProvider}". Use "open_meteo" or "qweather".`,
+      `Unsupported WEATHER_PROVIDER "${runtimeConfig.weatherProvider}". Use "open_meteo" or "qweather".`,
     )
   }
 
@@ -405,7 +405,7 @@ async function getOpenMeteoWeather(location) {
 }
 
 async function getQWeather(location) {
-  if (!config.qweatherApiKey) {
+  if (!runtimeConfig.qweatherApiKey) {
     throw new Error('QWEATHER_API_KEY is not configured')
   }
 
@@ -484,12 +484,12 @@ async function fetchQWeatherNow(locationId) {
 }
 
 function buildQWeatherUrl(path) {
-  return new URL(path.replace(/^\/+/, ''), normalizeBaseUrl(config.qweatherApiHost))
+  return new URL(path.replace(/^\/+/, ''), normalizeBaseUrl(runtimeConfig.qweatherApiHost))
 }
 
 function getQWeatherHeaders() {
   return {
-    'X-QW-Api-Key': config.qweatherApiKey,
+    'X-QW-Api-Key': runtimeConfig.qweatherApiKey,
   }
 }
 

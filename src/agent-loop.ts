@@ -36,7 +36,7 @@ export type AgentDecision =
 // Agent Loop 中，llm 不是直接等于大模型，他是一个函数，读取当前状态，返回下一步决策
 export type LLM = (input: {
   // 输入上下文信息和执行工具
-  message: Message[];
+  messages: Message[];
   tools: Tool[];
 }) => Promise<AgentDecision>;
 

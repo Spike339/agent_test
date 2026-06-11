@@ -28,6 +28,12 @@ export async function runAgent(input) {
 
   let step = 0
 
+  let usage = {
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    total_tokens: 0,
+  }
+
   while (step < resolvedOptions.maxSteps) {
     step += 1
 
@@ -35,6 +41,10 @@ export async function runAgent(input) {
       messages,
       tools,
     })
+
+    if (decision.usage) {
+      usage = mergeUsage(usage, decision.usage)
+    }
 
     onTrace?.({
       step,
@@ -58,6 +68,7 @@ export async function runAgent(input) {
         status: 'completed',
         content: decision.content,
         messages,
+        usage,
       }
     }
 
@@ -66,6 +77,7 @@ export async function runAgent(input) {
         status: 'failed',
         reason: `Unknown agent decision type: ${decision.type}`,
         messages,
+        usage,
       }
     }
 
@@ -156,6 +168,7 @@ export async function runAgent(input) {
     status: 'stopped',
     reason: 'Max steps reached',
     messages,
+    usage,
   }
 }
 
@@ -190,4 +203,13 @@ function withTimeout(task, timeoutMs) {
         reject(error)
       })
   })
+}
+
+function mergeUsage(current, next) {
+  return {
+    prompt_tokens: current.prompt_tokens + Number(next.prompt_tokens ?? 0),
+    completion_tokens:
+      current.completion_tokens + Number(next.completion_tokens ?? 0),
+    total_tokens: current.total_tokens + Number(next.total_tokens ?? 0),
+  }
 }
