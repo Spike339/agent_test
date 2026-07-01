@@ -1,6 +1,7 @@
 import { runAgent } from "./agent-runtime.mjs";
 import { getToolDefinitions, runToolCall } from "./tools.mjs";
-import * as serverConfig from '../config.mjs';
+import { saveToolCallLog } from "./log.mjs";
+import * as serverConfig from "../config.mjs";
 
 const config = serverConfig.config ?? serverConfig.runtimeConfig;
 // agent-chat 是业务适配层
@@ -9,10 +10,22 @@ export async function createAgentChatCompletion({ messages, model }) {
   const startedAt = Date.now();
   const requestId = crypto.randomUUID();
   const selectedModel = model ?? config.openaiModel;
+  // 记录当前在第几步
+  let currentStep = 0;
+  // 记录模型刚决定调用哪个工具
+  let currentToolCall = null;
   // 真实的调用 runAgnet，
   const agentResult = await runAgent({
-    llm: createRealLLM({ model: selectedModel }), 
-    tools: createRuntimeTools(),
+    llm: createRealLLM({ model: selectedModel }),
+    tools: createRuntimeTools({
+      requestId,
+      getExecutionContext() {
+        return {
+          step: currentStep,
+          toolCall: currentToolCall,
+        };
+      },
+    }),
     messages: [...messages],
     options: {
       maxSteps: 3,
@@ -21,6 +34,10 @@ export async function createAgentChatCompletion({ messages, model }) {
     },
     // 接入 Trace，用来观察 Agent Runtime 的执行过程
     onTrace(event) {
+      if (event.type === "llm_decision") {
+        currentStep = event.step ?? currentStep;
+        currentToolCall = event.data?.toolCall ?? null;
+      }
       trace.push(event);
       console.log("[agent trace]", event);
     },
@@ -58,32 +75,32 @@ export async function createAgentChatCompletion({ messages, model }) {
 */
 function createRealLLM({ model }) {
   // 选择模型
-  const selectedModel = model ?? config.openaiModel
+  const selectedModel = model ?? config.openaiModel;
   // 返回一个LLM函数
   return async function realLLM({ messages, tools }) {
     // 校验有没有 ApiKey
     if (!config.openaiApiKey) {
-      throw new Error("OPENAI_API_KEY is not configured")
+      throw new Error("OPENAI_API_KEY is not configured");
     }
     // OpenAI 请求。把Runtime 的数据转换成OpenAi 需要的格式
-    const data = await postOpenAiJson('chat/completions', {
+    const data = await postOpenAiJson("chat/completions", {
       model: selectedModel,
       messages: toOpenAiMessages(messages),
       tools: toOpenAITools(tools),
-      tool_choice: 'auto',
-    })
+      tool_choice: "auto",
+    });
 
     const message = data.choices?.[0]?.message;
 
     if (!message) {
-      throw new Error('OpenAI returned no message')
+      throw new Error("OpenAI returned no message");
     }
     // 如果模型需要调用工具，转换成 tool_call
-    const toolCall = message.tool_calls?.[0]
+    const toolCall = message.tool_calls?.[0];
 
     if (toolCall) {
       return {
-        type: 'tool_call',
+        type: "tool_call",
         // 这里还是格式转换
         toolCall: {
           id: toolCall.id ?? crypto.randomUUID(),
@@ -91,25 +108,25 @@ function createRealLLM({ model }) {
           args: parseToolArguments(toolCall.function?.arguments),
         },
         usage: normalizeUsage(data.usage),
-      }
+      };
     }
 
-    const content = normalizeContent(message.content)
+    const content = normalizeContent(message.content);
 
     if (!content.trim()) {
-      throw new Error('OpenAI returned empty content')
+      throw new Error("OpenAI returned empty content");
     }
     // 如果模型不调用工具，转换为 final
     return {
-      type: 'final',
+      type: "final",
       content,
       usage: normalizeUsage(data.usage),
-    }
-  }
+    };
+  };
 }
 
 // 接入项目已有 tools
-function createRuntimeTools() {
+function createRuntimeTools({ requestId, getExecutionContext }) {
   return getToolDefinitions().map((definition) => {
     const toolDefinition = definition.function;
 
@@ -118,10 +135,68 @@ function createRuntimeTools() {
       description: toolDefinition.description,
       parameters: toolDefinition.parameters,
       async run(args) {
-        return runToolCall(toolDefinition.name, args);
+        // 这里不直接走 runToolCall，而是走 runToolCallWithLog，这样每次工具执行都会落日志
+        return runToolCallWithLog({
+          requestId,
+          provider: "agent_chat",
+          iteration: step,
+          toolCallId: toolCall?.id ?? crypto.randomUUID(),
+          toolName: toolDefinition.name,
+          rawArguments: args,
+        });
       },
     };
   });
+}
+
+async function runToolCallWithLog({
+  requestId,
+  provider,
+  iteration,
+  toolCallId,
+  toolName,
+  rawArguments,
+}) {
+  const startedAt = Data.now();
+ 
+  try {
+    // 成功时记录 result
+    const result = await runToolCall(toolName, rawArguments);
+
+    await saveToolCallLog({
+      requestId,
+      provider,
+      iteration,
+      toolCallId,
+      toolName,
+      arguments: rawArguments,
+      result,
+      status: "success",
+      latencyMs: Date.now() - startedAt,
+    });
+
+    return result;
+  } catch (error) {
+    //  失败时 记录 error
+    const message =
+      error instanceof Error ? error.message : "Unknown tool error";
+
+    await saveToolCallLog({
+      requestId,
+      provider,
+      iteration,
+      toolCallId,
+      toolName,
+      arguments: rawArguments,
+      error: {
+        message,
+      },
+      status: "error",
+      latencyMs: Date.now() - startedAt,
+    });
+
+    throw error;
+  }
 }
 
 async function fakeLLM({ messages }) {
@@ -172,104 +247,107 @@ function getAgentContent(agentResult) {
 
 function toOpenAiMessages(messages) {
   return messages.map((message) => {
-    if (message.role === 'tool') {
+    if (message.role === "tool") {
       return {
-        role: 'user',
+        role: "user",
         content: `Tool result:\n${message.content}`,
-      }
+      };
     }
 
     return {
       role: message.role,
       content: message.content,
-    }
-  })
+    };
+  });
 }
 
 function toOpenAITools(tools) {
   return tools.map((tool) => ({
-    type: 'function',
+    type: "function",
     function: {
       name: tool.name,
       description: tool.description,
       parameters: tool.parameters ?? {
-        type: 'object',
+        type: "object",
         properties: {},
         additionalProperties: false,
-      }
-    }
-  }))
+      },
+    },
+  }));
 }
 
 function parseToolArguments(rawArguments) {
   if (!rawArguments) {
-    return {}
+    return {};
   }
 
-  if (typeof rawArguments === 'object') {
-    return rawArguments
+  if (typeof rawArguments === "object") {
+    return rawArguments;
   }
 
   try {
-    return JSON.parse(rawArguments)
+    return JSON.parse(rawArguments);
   } catch {
-    throw new Error('Tool arguments must be valid JSON')
+    throw new Error("Tool arguments must be valid JSON");
   }
 }
 
 function normalizeContent(content) {
-  console.log('%c [ content ]-207', 'font-size:13px; background:pink; color:#bf2c9f;', content)
-  if (typeof content === 'string') {
-    return content
+  console.log(
+    "%c [ content ]-207",
+    "font-size:13px; background:pink; color:#bf2c9f;",
+    content,
+  );
+  if (typeof content === "string") {
+    return content;
   }
 
   if (Array.isArray(content)) {
     return content
       .map((item) => {
-        if (typeof item === 'string') {
-          return item
+        if (typeof item === "string") {
+          return item;
         }
 
-        return item?.text ?? ''
+        return item?.text ?? "";
       })
-      .join('')
+      .join("");
   }
 
-  return ''
+  return "";
 }
 
 async function postOpenAiJson(path, payload) {
-  const baseUrl = config.openaiBaseUrl.replace(/\/$/, '')
+  const baseUrl = config.openaiBaseUrl.replace(/\/$/, "");
   const response = await fetch(`${baseUrl}/${path}`, {
-    method: 'POST',
+    method: "POST",
     headers: {
       Authorization: `Bearer ${config.openaiApiKey}`,
-      'Content-Type': 'application/json',
+      "Content-Type": "application/json",
     },
     body: JSON.stringify(payload),
-  })
+  });
 
-  const data = await response.json().catch(() => null)
+  const data = await response.json().catch(() => null);
 
   if (!response.ok) {
-    const message = 
-      data?.error?.message ?? `OpenAI request failed with ${response.status}`
+    const message =
+      data?.error?.message ?? `OpenAI request failed with ${response.status}`;
 
-    throw new Error(message)
+    throw new Error(message);
   }
 
-  return data
+  return data;
 }
 
-
 function normalizeUsage(usage) {
-  const promptTokens = usage?.prompt_tokens ?? 0
-  const completionTokens = usage?.completion_tokens ?? 0
-  const totalTokens = usage?.total_tokens ?? promptTokens + completionTokens
+  const promptTokens = usage?.prompt_tokens ?? 0;
+  const completionTokens = usage?.completion_tokens ?? 0;
+  const totalTokens = usage?.total_tokens ?? promptTokens + completionTokens;
 
   return {
     prompt_tokens: promptTokens,
     completion_tokens: completionTokens,
     total_tokens: totalTokens,
-  }
+  };
 }
