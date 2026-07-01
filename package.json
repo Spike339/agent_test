@@ -8,6 +8,7 @@
     "dev:api": "node server/index.mjs",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "test": "node --test server/**/*.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

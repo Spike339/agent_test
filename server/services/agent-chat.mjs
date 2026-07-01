@@ -96,17 +96,19 @@ function createRealLLM({ model }) {
       throw new Error("OpenAI returned no message");
     }
     // 如果模型需要调用工具，转换成 tool_call
-    const toolCall = message.tool_calls?.[0];
+    const toolCalls = Array.isArray(message.tool_calls)
+      ? message.tool_calls
+      : [];
 
-    if (toolCall) {
+    if (toolCalls.length > 0) {
       return {
         type: "tool_call",
         // 这里还是格式转换
-        toolCall: {
+        toolCalls: toolCalls.map((toolCall) => ({
           id: toolCall.id ?? crypto.randomUUID(),
           name: toolCall.function?.name,
           args: parseToolArguments(toolCall.function?.arguments),
-        },
+        })),
         usage: normalizeUsage(data.usage),
       };
     }
@@ -134,7 +136,9 @@ function createRuntimeTools({ requestId, getExecutionContext }) {
       name: toolDefinition.name,
       description: toolDefinition.description,
       parameters: toolDefinition.parameters,
-      async run(args) {
+      async run(args, context) {
+        const { step, toolCall } = context ?? getExecutionContext();
+
         // 这里不直接走 runToolCall，而是走 runToolCallWithLog，这样每次工具执行都会落日志
         return runToolCallWithLog({
           requestId,
@@ -157,8 +161,8 @@ async function runToolCallWithLog({
   toolName,
   rawArguments,
 }) {
-  const startedAt = Data.now();
- 
+  const startedAt = Date.now();
+
   try {
     // 成功时记录 result
     const result = await runToolCall(toolName, rawArguments);
@@ -249,15 +253,25 @@ function toOpenAiMessages(messages) {
   return messages.map((message) => {
     if (message.role === "tool") {
       return {
-        role: "user",
-        content: `Tool result:\n${message.content}`,
+        role: "tool",
+        tool_call_id: message.tool_call_id,
+        content: message.content,
       };
     }
 
-    return {
+    const openAiMessage = {
       role: message.role,
-      content: message.content,
     };
+
+    if ("content" in message) {
+      openAiMessage.content = message.content;
+    }
+
+    if (Array.isArray(message.tool_calls)) {
+      openAiMessage.tool_calls = message.tool_calls;
+    }
+
+    return openAiMessage;
   });
 }
 

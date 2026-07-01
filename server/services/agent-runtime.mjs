@@ -81,81 +81,79 @@ export async function runAgent(input) {
       }
     }
 
-    const toolCall = decision.toolCall
-    const tool = toolMap.get(toolCall.name)
-
-    if (!tool) {
-      const errorMessage = `Tool not found: ${toolCall.name}`
-
-      messages.push({
-        role: 'tool',
-        content: JSON.stringify({
-          error: true,
-          message: errorMessage,
-        }),
-      })
-
-      onTrace?.({
-        step,
-        type: 'tool_error',
-        data: {
-          tool: toolCall.name,
-          error: errorMessage,
-        },
-      })
-
-      continue
-    }
+    const toolCalls = normalizeToolCalls(decision)
 
     messages.push({
       role: 'assistant',
-      content: JSON.stringify({
-        type: 'tool_call',
-        toolCall,
-      }),
+      content: null,
+      tool_calls: toolCalls.map(toChatCompletionToolCall),
     })
 
-    try {
-      const toolResult = await runToolWithRetry({
-        tool,
-        args: toolCall.args,
-        maxRetries: resolvedOptions.maxToolRetries,
-        timeoutMs: resolvedOptions.toolTimeoutMs,
-      })
+    const toolMessages = await Promise.all(
+      toolCalls.map(async (toolCall) => {
+        const tool = toolMap.get(toolCall.name)
 
-      messages.push({
-        role: 'tool',
-        content: JSON.stringify(toolResult),
-      })
+        if (!tool) {
+          const errorMessage = `Tool not found: ${toolCall.name}`
 
-      onTrace?.({
-        step,
-        type: 'tool_result',
-        data: {
-          tool: toolCall.name,
-          result: toolResult,
-        },
-      })
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+          onTrace?.({
+            step,
+            type: 'tool_error',
+            data: {
+              tool: toolCall.name,
+              error: errorMessage,
+            },
+          })
 
-      messages.push({
-        role: 'tool',
-        content: JSON.stringify({
-          error: true,
-          message,
-        }),
-      })
+          return buildToolMessage(toolCall, {
+            error: true,
+            message: errorMessage,
+          })
+        }
 
-      onTrace?.({
-        step,
-        type: 'tool_error',
-        data: {
-          tool: toolCall.name,
-          error: message,
-        },
-      })
-    }
+        try {
+          const toolResult = await runToolWithRetry({
+            tool,
+            args: toolCall.args,
+            maxRetries: resolvedOptions.maxToolRetries,
+            timeoutMs: resolvedOptions.toolTimeoutMs,
+            context: {
+              step,
+              toolCall,
+            },
+          })
+
+          onTrace?.({
+            step,
+            type: 'tool_result',
+            data: {
+              tool: toolCall.name,
+              result: toolResult,
+            },
+          })
+
+          return buildToolMessage(toolCall, toolResult)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+
+          onTrace?.({
+            step,
+            type: 'tool_error',
+            data: {
+              tool: toolCall.name,
+              error: message,
+            },
+          })
+
+          return buildToolMessage(toolCall, {
+            error: true,
+            message,
+          })
+        }
+      }),
+    )
+
+    messages.push(...toolMessages)
   }
 
   onTrace?.({
@@ -173,12 +171,12 @@ export async function runAgent(input) {
 }
 
 export async function runToolWithRetry(input) {
-  const { tool, args, maxRetries, timeoutMs } = input
+  const { tool, args, maxRetries, timeoutMs, context } = input
   let lastError
 
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     try {
-      return await withTimeout(() => tool.run(args), timeoutMs)
+      return await withTimeout(() => tool.run(args, context), timeoutMs)
     } catch (error) {
       lastError = error
     }
@@ -211,5 +209,38 @@ function mergeUsage(current, next) {
     completion_tokens:
       current.completion_tokens + Number(next.completion_tokens ?? 0),
     total_tokens: current.total_tokens + Number(next.total_tokens ?? 0),
+  }
+}
+
+function normalizeToolCalls(decision) {
+  const rawToolCalls = Array.isArray(decision.toolCalls)
+    ? decision.toolCalls
+    : decision.toolCall
+      ? [decision.toolCall]
+      : []
+
+  return rawToolCalls.map((toolCall) => ({
+    id: toolCall.id ?? crypto.randomUUID(),
+    name: toolCall.name ?? '',
+    args: toolCall.args ?? {},
+  }))
+}
+
+function toChatCompletionToolCall(toolCall) {
+  return {
+    id: toolCall.id,
+    type: 'function',
+    function: {
+      name: toolCall.name,
+      arguments: JSON.stringify(toolCall.args ?? {}),
+    },
+  }
+}
+
+function buildToolMessage(toolCall, result) {
+  return {
+    role: 'tool',
+    tool_call_id: toolCall.id,
+    content: JSON.stringify(result),
   }
 }
