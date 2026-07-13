@@ -13,12 +13,20 @@ export const AgentState = Object.freeze({
   RETRYING: "retrying",
   DONE: "done",
   ERROR: "error",
+  WAITING_FOR_APPROVAL: "waiting_for_approval",
+});
+
+// 把“错误后怎么恢复”从隐式逻辑变成明确策略。
+export const RecoveryStrategy = Object.freeze({
+  RETURN_ERROR_TO_MODEL: "return_error_to_model",
+  FAIL_FAST: "fail_fast",
 });
 
 export const defaultAgentOptions = {
   maxSteps: 6,
   maxToolRetries: 1,
   toolTimeoutMs: 8000,
+  toolErrorStrategy: RecoveryStrategy.RETURN_ERROR_TO_MODEL,
 };
 
 export async function runAgent(input) {
@@ -34,17 +42,33 @@ export async function runAgent(input) {
     ...defaultAgentOptions,
     ...options,
   };
+
+  // 已批准
+  const approvedToolCallIds = new Set(
+    resolvedOptions.approvedToolCallIds ?? [],
+  );
+  // 被拒绝的ToolCallId
+  const rejectedToolCallIds = new Set(
+    resolvedOptions.rejectedToolCallIds ?? [],
+  );
   const toolMap = new Map(tools.map((tool) => [tool.name, tool]));
 
   let step = 0;
 
   let state = AgentState.IDLE;
 
+  const traceEvents = [];
+
+  function emitTrace(event) {
+    traceEvents.push(event);
+    onTrace?.(event);
+  }
+
   function transition(nextState, data = {}) {
     const previousState = state;
     state = nextState;
 
-    onTrace?.({
+    emitTrace?.({
       step,
       type: "state_transition",
       data: {
@@ -63,7 +87,7 @@ export async function runAgent(input) {
 
   while (step < resolvedOptions.maxSteps) {
     step += 1;
-
+    // 在 Agent 里，planning 不一定是“生成一个完整任务清单”。
     transition(AgentState.PLANNING, {
       reason: "asking model for next decision",
     });
@@ -77,7 +101,7 @@ export async function runAgent(input) {
       usage = mergeUsage(usage, decision.usage);
     }
 
-    onTrace?.({
+    emitTrace?.({
       step,
       type: "llm_decision",
       data: decision,
@@ -86,7 +110,7 @@ export async function runAgent(input) {
     //  根据决策制定计划
     const plan = buildPlanFromDecision(decision);
 
-    onTrace?.({
+    emitTrace?.({
       step,
       type: "plan_created",
       data: plan,
@@ -98,7 +122,7 @@ export async function runAgent(input) {
         content: decision.content,
       });
 
-      onTrace?.({
+      emitTrace?.({
         step,
         type: "final",
         data: decision.content,
@@ -112,6 +136,12 @@ export async function runAgent(input) {
         content: decision.content,
         messages,
         usage,
+        report: buildExecutionReport({
+          status: "completed",
+          finalState: AgentState.DONE,
+          step,
+          traceEvents,
+        }),
       };
     }
 
@@ -140,14 +170,14 @@ export async function runAgent(input) {
       tool_calls: toolCalls.map(toChatCompletionToolCall),
     });
 
-    const toolMessages = await Promise.all(
+    const toolResults = await Promise.all(
       toolCalls.map(async (toolCall) => {
         const tool = toolMap.get(toolCall.name);
 
         if (!tool) {
           const errorMessage = `Tool not found: ${toolCall.name}`;
 
-          onTrace?.({
+          emitTrace?.({
             step,
             type: "tool_error",
             data: {
@@ -156,10 +186,93 @@ export async function runAgent(input) {
             },
           });
 
-          return buildToolMessage(toolCall, {
-            error: true,
-            message: errorMessage,
+          const recovery = buildToolErrorRecovery({
+            toolCall,
+            errorMessage,
+            reason: "tool_not_found",
+            strategy: resolvedOptions.toolErrorStrategy,
           });
+
+          emitTrace?.({
+            step,
+            type: "recovery_decision",
+            data: recovery,
+          });
+
+          if (recovery.action === "fail_agent") {
+            return {
+              failed: true,
+              reason: `${recovery.reason}: ${recovery.tool}`,
+              recovery,
+            };
+          }
+
+          return {
+            message: buildToolMessage(toolCall, recovery.observation),
+          };
+        }
+
+        // 已批准
+        const isApproved = approvedToolCallIds.has(toolCall.id);
+        //
+        const isRejected = rejectedToolCallIds.has(toolCall.id);
+
+        // 审批被拒绝
+        if (tool.requiresApproval && isRejected) {
+          const observation = {
+            error: true,
+            approval_rejected: true,
+            message: "Tool execution was rejected by human.",
+            tool: toolCall.name,
+          };
+
+          emitTrace?.({
+            step,
+            type: "approval_rejected",
+            data: {
+              tool: toolCall.name,
+              toolCall,
+              observation,
+            },
+          });
+
+          return {
+            message: buildToolMessage(toolCall, observation),
+          };
+        }
+
+        if (tool.requiresApproval && !isApproved) {
+          const approvalRequest = {
+            id: crypto.randomUUID(),
+            step,
+            toolCall,
+            tool: {
+              name: tool.name,
+              description: tool.description ?? "",
+            },
+            reason: "tool requires approval",
+          };
+
+          emitTrace?.({
+            step,
+            type: "approval_required",
+            data: {
+              tool: toolCall.name,
+              toolCall,
+              approvalRequest,
+            },
+          });
+
+          transition(AgentState.WAITING_FOR_APPROVAL, {
+            reason: "tool requires approval",
+            tool: toolCall.name,
+            toolCall,
+          });
+
+          return {
+            requiresApproval: true,
+            approvalRequest,
+          };
         }
 
         try {
@@ -184,7 +297,7 @@ export async function runAgent(input) {
             },
           });
 
-          onTrace?.({
+          emitTrace?.({
             step,
             type: "tool_result",
             data: {
@@ -193,12 +306,14 @@ export async function runAgent(input) {
             },
           });
 
-          return buildToolMessage(toolCall, toolResult);
+          return {
+            message: buildToolMessage(toolCall, toolResult),
+          };
         } catch (error) {
           const message =
             error instanceof Error ? error.message : String(error);
 
-          onTrace?.({
+          emitTrace?.({
             step,
             type: "tool_error",
             data: {
@@ -207,13 +322,64 @@ export async function runAgent(input) {
             },
           });
 
-          return buildToolMessage(toolCall, {
-            error: true,
-            message,
+          const recovery = buildToolErrorRecovery({
+            toolCall,
+            errorMessage: message,
+            reason: "tool_execution_failed",
+            strategy: resolvedOptions.toolErrorStrategy,
           });
+
+          emitTrace?.({
+            step,
+            type: "recovery_decision",
+            data: recovery,
+          });
+
+          if (recovery.action === "fail_agent") {
+            return {
+              failed: true,
+              reason: `${recovery.reason}: ${recovery.tool}`,
+              recovery,
+            };
+          }
+
+          return {
+            message: buildToolMessage(toolCall, recovery.observation),
+          };
         }
       }),
     );
+
+    const approvalResult = toolResults.find(
+      (result) => result.requiresApproval,
+    );
+
+    if (approvalResult) {
+      return {
+        status: "waiting_for_approval",
+        approvalRequest: approvalResult.approvalRequest,
+        messages,
+        usage,
+      };
+    }
+
+    const failedToolResult = toolResults.find((result) => result.failed);
+
+    if (failedToolResult) {
+      transition(AgentState.ERROR, {
+        reason: failedToolResult.reason,
+        recovery: failedToolResult.recovery,
+      });
+
+      return {
+        status: "failed",
+        reason: failedToolResult.reason,
+        messages,
+        usage,
+      };
+    }
+
+    const toolMessages = toolResults.map((result) => result.message);
 
     messages.push(...toolMessages);
     transition(AgentState.OBSERVING, {
@@ -221,7 +387,7 @@ export async function runAgent(input) {
     });
   }
 
-  onTrace?.({
+  emitTrace?.({
     step,
     type: "stopped",
     data: "Max steps reached",
@@ -338,6 +504,32 @@ function buildPlanFromDecision(decision) {
   };
 }
 
+// Error Recovery 是 Runtime 的能力，不是模型的能力。模型可以看到错误，但“错误后允许继续、重试、还是终止”，应该由 Runtime 控制。
+function buildToolErrorRecovery({
+  toolCall,
+  errorMessage,
+  reason,
+  strategy = RecoveryStrategy.RETURN_ERROR_TO_MODEL,
+}) {
+  const action =
+    strategy === RecoveryStrategy.FAIL_FAST
+      ? "fail_agent"
+      : "return_error_to_model";
+
+  return {
+    strategy,
+    action,
+    reason,
+    tool: toolCall.name,
+    recoverable: action !== "fail_agent",
+    observation: {
+      error: true,
+      message: errorMessage,
+      recovery_strategy: strategy,
+    },
+  };
+}
+
 function toChatCompletionToolCall(toolCall) {
   return {
     id: toolCall.id,
@@ -354,5 +546,43 @@ function buildToolMessage(toolCall, result) {
     role: "tool",
     tool_call_id: toolCall.id,
     content: JSON.stringify(result),
+  };
+}
+
+function buildExecutionReport({ status, finalState, step, traceEvents }) {
+  const statePath = traceEvents
+    .filter((event) => event.type === "state_transition")
+    .map((event) => event.data.to);
+
+  const successfulToolCalls = traceEvents
+    .filter((event) => event.type === "tool_result")
+    .map((event) => ({
+      name: event.data.tool,
+      status: "success",
+    }));
+
+  const failedToolCalls = traceEvents
+    .filter((event) => event.type === "tool_error")
+    .map((event) => ({
+      name: event.data.tool,
+      status: "error",
+    }));
+
+  return {
+    status,
+    finalState,
+    totalSteps: step,
+    statePath,
+    toolCalls: [...successfulToolCalls, ...failedToolCalls],
+    retryCount: traceEvents.filter(
+      (event) =>
+        event.type === "state_transition" &&
+        event.data.to === AgentState.RETRYING,
+    ).length,
+    errorCount: traceEvents.filter((event) => event.type === "tool_error")
+      .length,
+    approvalRequiredCount: traceEvents.filter(
+      (event) => event.type === "approval_required",
+    ).length,
   };
 }
